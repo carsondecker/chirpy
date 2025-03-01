@@ -8,8 +8,10 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/carsondecker/chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -17,6 +19,22 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	platform       string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 func main() {
@@ -28,8 +46,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	platform := os.Getenv("PLATFORM")
+
 	apiCfg := &apiConfig{
-		db: database.New(db),
+		db:       database.New(db),
+		platform: platform,
 	}
 
 	mux := http.NewServeMux()
@@ -42,17 +63,20 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", healthzHandler)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirpHandler)
+	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.createChirpHandler)
+	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	server.ListenAndServe()
 }
 
-func healthzHandler(w http.ResponseWriter, req *http.Request) {
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(200)
 	w.Write([]byte("OK"))
 }
 
-func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/html")
 	w.WriteHeader(200)
 	html := fmt.Sprintf(`<html>
@@ -64,26 +88,33 @@ func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, req *http.Request) {
 	w.Write([]byte(html))
 }
 
-func (cfg *apiConfig) resetHandler(w http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		w.WriteHeader(403)
+		return
+	}
+
+	cfg.fileserverHits.Store(0)
+	if err := cfg.db.ResetUsers(r.Context()); err != nil {
+		w.WriteHeader(500)
+		return
+	}
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(200)
-	cfg.fileserverHits.Store(0)
 }
 
-func validateChirpHandler(w http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Body string `json:"body"`
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
 	}
 
 	params := parameters{}
 
-	w.Header().Set("Content-Type", "application/json")
-
-	decoder := json.NewDecoder(req.Body)
-	defer req.Body.Close()
-	err := decoder.Decode(&params)
-	if err != nil {
-		respondWithError(w, 500, "Failed to unmarshal json")
+	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
+	if err := decoder.Decode(&params); err != nil {
+		respondWithError(w, 500, "Failed to decode json")
 		return
 	}
 
@@ -92,16 +123,78 @@ func validateChirpHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	type resSuccess struct {
-		CleanedBody string `json:"cleaned_body"`
+	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   cleanMessage(params.Body),
+		UserID: params.UserID,
+	})
+	if err != nil {
+		respondWithError(w, 500, "Could not create chirp")
 	}
-	respondWithJSON(w, 200, resSuccess{CleanedBody: cleanMessage(params.Body)})
+
+	respondWithJSON(w, 201, Chirp(chirp))
+}
+
+func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email string `json:"email"`
+	}
+
+	params := parameters{}
+
+	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
+	if err := decoder.Decode(&params); err != nil {
+		respondWithError(w, 500, "Failed to decode json")
+		return
+	}
+
+	user, err := cfg.db.CreateUser(r.Context(), params.Email)
+	if err != nil {
+		respondWithError(w, 500, "Failed to create user")
+		return
+	}
+
+	respondWithJSON(w, 201, User(user))
+}
+
+func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.db.GetChirps(r.Context())
+	if err != nil {
+		respondWithError(w, 500, "Failed to get chirps")
+		return
+	}
+
+	convertedChirps := make([]Chirp, len(chirps))
+	for i, chirp := range chirps {
+		convertedChirps[i] = Chirp(chirp)
+	}
+
+	respondWithJSON(w, 200, convertedChirps)
+}
+
+func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, r *http.Request) {
+	chirpID, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 500, "Failed to parse chirp id")
+	}
+
+	chirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			w.WriteHeader(404)
+			return
+		}
+		respondWithError(w, 500, "Failed to get chirp")
+		return
+	}
+
+	respondWithJSON(w, 200, Chirp(chirp))
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg.fileserverHits.Add(1)
-		next.ServeHTTP(w, req)
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -123,19 +216,16 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 func cleanMessage(msg string) string {
-	profanities := []string{
-		"sharbert",
-		"kerfuffle",
-		"fornax",
+	profanities := map[string]struct{}{
+		"sharbert":  {},
+		"kerfuffle": {},
+		"fornax":    {},
 	}
 
 	splitMsg := strings.Split(msg, " ")
 	for i, word := range splitMsg {
-		for _, profanity := range profanities {
-			if strings.ToLower(word) == profanity {
-				splitMsg[i] = "****"
-				break
-			}
+		if _, exists := profanities[strings.ToLower(word)]; exists {
+			splitMsg[i] = "****"
 		}
 	}
 
