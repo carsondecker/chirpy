@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -72,7 +73,7 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
-	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
+	mux.HandleFunc("GET /api/chirps/{ID}", apiCfg.getChirpWithIDHandler)
 	mux.HandleFunc("POST /api/chirps", apiCfg.createChirpHandler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
@@ -205,6 +206,13 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
 		convertedChirps[i] = Chirp(chirp)
 	}
 
+	sortOrder := r.URL.Query().Get("sort")
+	if sortOrder == "" || sortOrder == "asc" {
+		sort.Slice(convertedChirps, func(i, j int) bool { return convertedChirps[i].CreatedAt.Before(convertedChirps[j].CreatedAt) })
+	} else {
+		sort.Slice(convertedChirps, func(i, j int) bool { return convertedChirps[i].CreatedAt.After(convertedChirps[j].CreatedAt) })
+	}
+
 	respondWithJSON(w, 200, convertedChirps)
 }
 
@@ -212,6 +220,7 @@ func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, r *http.Request) {
 	chirpID, err := uuid.Parse(r.PathValue("chirpID"))
 	if err != nil {
 		respondWithError(w, 500, "Failed to parse chirp id")
+		return
 	}
 
 	chirp, err := cfg.db.GetChirp(r.Context(), chirpID)
@@ -476,6 +485,42 @@ func (cfg *apiConfig) polkaWebhooksHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.WriteHeader(204)
+}
+
+func (cfg *apiConfig) getChirpsByAuthorHandler(w http.ResponseWriter, r *http.Request) {
+	authorID, err := uuid.Parse(r.PathValue("authorID"))
+	if err != nil {
+		respondWithError(w, 500, "Failed to parse author id")
+		return
+	}
+
+	chirps, err := cfg.db.GetChirpsByAuthor(r.Context(), authorID)
+	if err != nil {
+		respondWithError(w, 500, "Failed to get author's chirps")
+	}
+
+	convertedChirps := make([]Chirp, len(chirps))
+	for i, chirp := range chirps {
+		convertedChirps[i] = Chirp(chirp)
+	}
+
+	respondWithJSON(w, 200, convertedChirps)
+}
+
+func (cfg *apiConfig) getChirpWithIDHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("chirp_id")
+	if id != "" {
+		cfg.getChirpHandler(w, r)
+		return
+	}
+
+	id = r.URL.Query().Get("author_id")
+	if id != "" {
+		cfg.getChirpsByAuthorHandler(w, r)
+		return
+	}
+
+	respondWithError(w, 400, "Invalid id")
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {

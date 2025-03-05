@@ -30,5 +30,5 @@ RETURNING id, created_at, updated_at, email, is_chirpy_red;
 
 -- name: UpdateChirpyRedStatus :exec
 UPDATE users
-SET is_chirpy_red = true
+SET is_chirpy_red = true, updated_at = NOW()
 WHERE id = $1;

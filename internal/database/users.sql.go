@@ -101,7 +101,7 @@ func (q *Queries) ResetUsers(ctx context.Context) error {
 
 const updateChirpyRedStatus = `-- name: UpdateChirpyRedStatus :exec
 UPDATE users
-SET is_chirpy_red = true
+SET is_chirpy_red = true, updated_at = NOW()
 WHERE id = $1
 `
 
